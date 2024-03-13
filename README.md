@@ -1,4 +1,4 @@
-# traffic-latency-simulator
+# R-simmer MAN traffic simulator with latency percentiles
 
 This repository contains scripts for simulating traffic latency in two network topologies **Milano** and **Tokyo** using Google Colab notebooks. The main scripts are:
 
