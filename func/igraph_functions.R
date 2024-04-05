@@ -40,7 +40,7 @@ calc_full_traffic_for_matrix <- function(graph, matrix_traffic, N =1250) {
   V(graph)$Traffic_Local_Gbps <- V(graph)$Traffic_Local*8*N/(10^9)
   V(graph)$Traffic_Total_Gbps <- V(graph)$Traffic_Start_Gbps + V(graph)$Traffic_Pass_Gbps + V(graph)$Traffic_End_Gbps + V(graph)$Traffic_Local_Gbps
   
-  write_nodes_log_report(graph)
+  #write_nodes_log_report(graph)
   return(graph)
 }
 

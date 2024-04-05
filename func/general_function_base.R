@@ -76,6 +76,17 @@ func_bounds_markov <- function(mu, a)
   return(upper_bound_Markov)
 }
 
+func_bounds_VP <- function(delay_hops, a)
+{
+  mu = sum(delay_hops)
+  sigma = sqrt(sum(delay_hops^2))
+  ###################Vysochanskij–Petunin's bound
+  k <- sqrt(4/9/(1-a))
+  Prop_VP <- 1 - 4/9/(k^2)
+  upper_bound_VP <- k * sigma + mu
+  return(upper_bound_VP)
+}
+
 func_bounds_chebyshev <- function(mu, variance, a)
 {
   sigma2 = sqrt(variance)
@@ -117,8 +128,10 @@ func_bounds_theoretical <- function(mu, variance, a, delay_queue, delay_prop, pe
   
   ##################Hoeffding's inequality
   upper_bound_heoff <- func_bounds_hoeffding(mu, a, delay_queue, delay_prop, percentile_of_max = 0.99)
-  
-  return(list(upper_bound_Markov, upper_bound_cheb, upper_bound_heoff))
+  ###################Vysochanskij–Petunin's bound
+  upper_bound_VP <- func_bounds_VP(delay_queue, a) + delay_prop
+    
+  return(list(upper_bound_Markov, upper_bound_cheb, upper_bound_heoff, upper_bound_VP))
 }
 
 
