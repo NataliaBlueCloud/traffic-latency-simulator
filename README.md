@@ -1,6 +1,6 @@
 # R-simmer MAN traffic simulator with latency percentiles
 
-The Traffic Latency Simulator is a project that aims to analyze the end-to-end delays in a metro network topology, based on the packet size distribution and network load. The code provides two different approaches to calculating the delays: using a simmer simulation with an M/G/1 queueing model, and a theoretical delay calculation.
+The MAN Traffic Simulator is a project that aims to analyze the end-to-end delays in a metro network topology, based on the packet size distribution and network load. The code provides two different approaches to calculating the delays: using a simmer simulation with an M/G/1 queueing model, and a theoretical delay calculation.r
 
 This repository contains scripts for simulating traffic latency. 
 1. the script **simulation_MM1_Milano.ipynb** has the short test M/M/1, M/G/1, G/G/1;
