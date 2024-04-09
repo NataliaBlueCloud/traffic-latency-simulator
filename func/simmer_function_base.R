@@ -264,13 +264,13 @@ simmer_crosstrajectory_simulation_mg1 <- function(env, g, from, to, lambda_simme
   nodes_capacity[path[["vpath"]][[1]][-path_size]] <- E(g)$capacityGbps[path[["epath"]][[1]]]
   nodes_capacity_Bps <- nodes_capacity*1e9
   nodes_capacity <- nodes_capacity_Bps/(8*N)
-  
+
   nodes_load <- rep(0, length(V(g)))
   nodes_load[path[["vpath"]][[1]][-path_size]] <- E(g)$Load[path[["epath"]][[1]]]
-  
+
   for (i in path[["vpath"]][[1]][-path_size])
   {
-    
+
     load_compare <- lambda_simmer/(nodes_capacity[i])
     if (nodes_load[i] > load_compare )
     {
@@ -284,7 +284,7 @@ simmer_crosstrajectory_simulation_mg1 <- function(env, g, from, to, lambda_simme
         #timeout(function() rexp(1, get_attribute(env, "capacity"))) %>%
         #timeout(function() rexp(1, nodes_capacity[i])) %>%
         release(paste0("node_", i)) #%>%
-      
+
       name <- paste0("traffic_cross_", from,"_", to, "_node_", i,"_")
       assign(name, trajectory_name)
       traffic_val <- nodes_load[i] * nodes_capacity[i] - lambda_simmer
@@ -300,15 +300,15 @@ simmer_crosstrajectory_simulation_mg1 <- function(env, g, from, to, lambda_simme
 
 
 ########### generator + trajectory 
-simmer_simulation_mg1 <- function(env, from, to, graph, traffic_val, log_info, tr_units = 10^9, bps_ps = TRUE, PS_size, PS_weights)
+simmer_simulation_mg1 <- function(env, from, to, graph, traffic_val, log_info, PS_size, PS_weights)
 {
   name = paste0('traffic_', from, "_", to, "_", log_info)
-  if (from != to && traffic_val != 0) { 
+  if (from != to && traffic_val != 0) {
     c(traffic, delay_transm, delay_prop) := simmer_trajectory_simulation_mg1(env, from, to, trajectory_name = traffic , graph, log_info, PS_size = PS_size, PS_weights = PS_weights) #creating trajectory
     assign(name, traffic)
     print(name)
     #print(get(name))
-    env<- simmer_generator(env, get(name), name, traffic_val) 
+    env<- simmer_generator(env, get(name), name, traffic_val)
   }
   return(list(env, name, delay_transm, delay_prop))
 }
@@ -317,16 +317,16 @@ simmer_simulation_mg1 <- function(env, from, to, graph, traffic_val, log_info, t
 #simmer_traffic_simulation
 simmer_trajectory_simulation_mg1 <- function(env, from, to, trajectory_name, graph, log_info, PS_size, PS_weights)
 {
-  path <- shortest_paths(g, from, to, weights = NULL, output = "both", algorithm = c("automatic"))
+  path <- shortest_paths(graph, from, to, weights = NULL, output = "both", algorithm = c("automatic"))
   N = sum(PS_size*PS_weights)
   path_size <- length(path[["vpath"]][[1]])
-  nodes_capacity <- rep(0, length(V(g)))
-  nodes_capacity[path[["vpath"]][[1]][-path_size]] <- E(g)$capacityGbps[path[["epath"]][[1]]]
+  nodes_capacity <- rep(0, length(V(graph)))
+  nodes_capacity[path[["vpath"]][[1]][-path_size]] <- E(graph)$capacityGbps[path[["epath"]][[1]]]
   nodes_capacity_Bps <- nodes_capacity*1e9
   nodes_capacity <- nodes_capacity_Bps/(8*N)
   
-  nodes_load <- rep(0, length(V(g)))
-  nodes_load[path[["vpath"]][[1]][-path_size]] <- E(g)$Load[path[["epath"]][[1]]]
+  nodes_load <- rep(0, length(V(graph)))
+  nodes_load[path[["vpath"]][[1]][-path_size]] <- E(graph)$Load[path[["epath"]][[1]]]
   
   nodes_prop_delay <- rep(0, length(V(graph)))
   nodes_prop_delay[path[["vpath"]][[1]][-path_size]] <- E(graph)$Prop_Delay[path[["epath"]][[1]]]
@@ -335,10 +335,7 @@ simmer_trajectory_simulation_mg1 <- function(env, from, to, trajectory_name, gra
     trajectory() %>%
       seize(paste0("node_", i)) %>%
       set_attribute("capacity", nodes_capacity_Bps[i]) %>%
-      #set_attribute(function() "packet_size", sample(PS_size, size = 1, replace = T, prob = PS_weights)) %>%
       timeout(function() 8*sample(PS_size, size = 1, replace = T, prob = PS_weights)/(get_attribute(env, "capacity"))) %>%
-      #timeout(function() rexp(1, get_attribute(env, "capacity"))) %>%
-      #timeout(function() rexp(1, nodes_capacity[i])) %>%
       release(paste0("node_", i))  %>%
       timeout(function() nodes_prop_delay[i]) #%>%
   }) %>% join()
