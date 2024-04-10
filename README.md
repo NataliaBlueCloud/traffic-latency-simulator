@@ -3,7 +3,7 @@
 The MAN Traffic Simulator is a project that aims to analyze the end-to-end delays in a metro network topology, based on the packet size distribution and network load. The code provides two different approaches to calculating the delays: using a simmer simulation with an M/G/1 queueing model, and a theoretical delay calculation.r
 
 This repository contains scripts for simulating traffic latency. 
-1. the script **Simulation_3hop_path.ipynb.ipynb** has the short test of simulation M/M/1, M/G/1 queing models and their comparison;
+1. the script **Simulation_3hop_path.ipynb** has the short test of simulation M/M/1, M/G/1 queing models and their comparison;
 2. The main script is **simulation_MG1.ipynb** for two network topologies **Milano** and **Tokyo** using Google Colab notebooks. 
 
 ## Data Source
