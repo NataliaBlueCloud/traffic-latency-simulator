@@ -1,0 +1,878 @@
+---
+title: "simulation_MG1_800G"
+output:
+  pdf_document: default
+  html_document: default
+date: "2024-11-29"
+---
+
+```{r include=FALSE}
+library(ggplot2)
+library(igraph)
+library(stringr)
+library(simmer)
+library(tidyverse)
+library(readr)
+library(SciViews)
+library(dplyr)
+library(viridis)
+library(readxl)
+library(openxlsx)
+```
+
+
+
+```{r}
+source("func/igraph_functions.R")
+source("func/general_function_base.R")
+source("func/simmer_function_base.R")
+```
+#Input data
+
+The **average packet size** is taken from: Amsterdam Internet Exchange Ethernet Frame Size Distribution, statistics available online at https://stats.ams-ix.net/sflow/size.html, accessed on July 2023
+
+Packet sizes in Bytes: 64-127, 128-511, 512 - 1023, 1024 - 1513, 1514, more than 1515.
+
+
+With their probabilities: 0.332, 0.054, 0.033, 0.037, 0.346, 0.146, 0.052
+```{r}
+PS_size=c((64+127)/2,(128+255)/2,(256+511)/2, (512+1023)/2, (1024+1513)/2, 1514, (1515+9100)/2)
+PS_weights=c(33.2/100, 5.4/100, 3.3/100, 3.7/100, 34.6/100, 14.6/100, 5.2/100)
+N = sum(PS_size*PS_weights)
+N
+var_N <- sum(PS_size^2*PS_weights) - N^2
+Cs2 <- var_N/(N^2)
+
+CapacityGbps = 800
+#Calculation of delays for different capacities
+Load_local = 0.3
+Load_regional = 0.5
+Load_national = 0.4
+```
+
+Input excel file with topology information: links, nodes, traffic
+
+Prefix base - the common name for the nodes in the file.
+```{r}
+#topology_choice <- readline(prompt = "Enter 'Tokyo' or 'Milano' to choose the respective topology: ")
+
+# # Define the file paths based on user input
+file_name_v2 <- "input_files/Metro_topology_full_Tokyo.xlsx"
+prefix_base <- "Tokyo_"
+topology_name = "Tokyo"
+print(file_name_v2)
+
+# file_name_v2 <- "input_files/Metro_topology_full_Milano.xlsx"
+# prefix_base <- "Node"
+# topology_name = "Milano"
+# print(file_name_v2)
+# 
+# file_name_v2 <- "input_files/Metro_topology_MAN157.xlsx"
+# prefix_base <- ""
+# topology_name = "MAN157"
+# print(file_name_v2)
+
+
+```
+
+```{r}
+nodes_info <- read_excel(file_name_v2, sheet = 1)
+links_info <- read_excel(file_name_v2, sheet = 2)
+traffic_file <- read_excel(file_name_v2, sheet = 3)
+```
+
+```{r}
+print(links_info)
+print(nodes_info)
+print(traffic_file)
+```
+Definition of national and regional Cental Offices (COs).
+```{r}
+national_nodes <- c()
+regional_nodes <- c()
+
+for (i in seq_along(nodes_info$node_code)) {
+  if (nodes_info$node_code[i] == "HL2") {
+    national_nodes <- c(national_nodes, i)
+  }
+  if (nodes_info$node_code[i] == "HL3") {
+    regional_nodes <- c(regional_nodes, i)
+  }
+}
+
+cat("National nodes:", national_nodes, "\n")
+cat("Regional nodes:", regional_nodes, "\n")
+```
+
+# Functions
+### Vysochanskij–Petunin's bound calculation function
+Inputs:
+- **delay_hops**: Vector of delay at each hop
+- **a**: Upper bound percentile from 0 to 1
+
+Output:
+- Vysochanskij–Petunin's upper bound
+
+```{r}
+func_bounds_VP <- function(delay_hops, a)
+{
+  mu = sum(delay_hops)
+  sigma = sqrt(sum(delay_hops^2))
+  k <- sqrt(4/9/(1-a))
+  Prop_VP <- 1 - 4/9/(k^2)
+  upper_bound_VP <- k * sigma + mu
+  return(upper_bound_VP)
+}
+```
+
+##Simmer simulation
+
+
+<!-- ### Function to perform simulation in a simmer environment with M/G/1 queueing model -->
+<!-- Inputs: -->
+<!-- - **env**: Simmer environment -->
+<!-- - **from**: Source node -->
+<!-- - **to**: Destination node -->
+<!-- - **graph**: Graph object representing the network topology -->
+<!-- - **traffic_val**: Traffic value (lambda) for the simulation -->
+<!-- - **log_info**: Information for logging purposes -->
+<!-- - **PS_size**: Packet size -->
+<!-- - **PS_weights**: Packet weights -->
+
+<!-- Output: -->
+<!-- - List containing updated environment, trajectory name, transmission delay, and propagation delay -->
+
+```{r include=FALSE}
+simmer_simulation_mg1 <- function(env, from, to, graph, traffic_val, log_info, PS_size, PS_weights)
+{
+  name = paste0('traffic_', from, "_", to, "_", log_info)
+  if (from != to && traffic_val != 0) {
+    c(traffic, delay_transm, delay_prop) := simmer_trajectory_simulation_mg1(env, from, to, trajectory_name = traffic , graph, log_info, PS_size = PS_size, PS_weights = PS_weights) #creating trajectory
+    assign(name, traffic)
+    print(name)
+    #print(get(name))
+    env<- simmer_generator(env, get(name), name, traffic_val)
+  }
+  return(list(env, name, delay_transm, delay_prop))
+}
+```
+
+<!-- ### Function to create cross trajectories in the simmer environment based on the network load -->
+<!-- Inputs: -->
+<!-- - **env**: Simmer environment -->
+<!-- - **g**: Graph object representing the network topology -->
+<!-- - **from**: Source node -->
+<!-- - **to**: Destination node -->
+<!-- - **lambda_simmer**: Traffic value (lambda) for the simulation -->
+<!-- - **PS_size**: Packet size -->
+<!-- - **PS_weights**: Packet weights -->
+
+<!-- Output: -->
+<!-- - Updated simmer environment -->
+```{r include=FALSE}
+simmer_crosstrajectory_simulation_mg1 <- function(env, g, from, to, lambda_simmer, PS_size, PS_weights)
+{
+  path <- shortest_paths(g, from, to, weights = NULL, output = "both", algorithm = c("automatic"))
+  N = sum(PS_size*PS_weights)
+  path_size <- length(path[["vpath"]][[1]])
+  nodes_capacity <- rep(0, length(V(g)))
+  nodes_capacity[path[["vpath"]][[1]][-path_size]] <- E(g)$capacityGbps[path[["epath"]][[1]]]
+  nodes_capacity_Bps <- nodes_capacity*1e9
+  nodes_capacity <- nodes_capacity_Bps/(8*N)
+
+  nodes_load <- rep(0, length(V(g)))
+  nodes_load[path[["vpath"]][[1]][-path_size]] <- E(g)$Load[path[["epath"]][[1]]]
+
+  for (i in path[["vpath"]][[1]][-path_size])
+  {
+
+    load_compare <- lambda_simmer/(nodes_capacity[i])
+    if (nodes_load[i] > load_compare )
+    {
+      print(paste0("node_", i))
+      print(nodes_capacity[i])
+      print(nodes_load[i])
+      trajectory_name <- trajectory() %>%
+        seize(paste0("node_", i)) %>%
+        set_attribute("capacity", nodes_capacity_Bps[i]) %>%
+        timeout(function() 8*sample(PS_size,size = 1, replace = T, prob = PS_weights)/(get_attribute(env, "capacity"))) %>%
+        release(paste0("node_", i)) #%>%
+
+      name <- paste0("traffic_cross_", from,"_", to, "_node_", i,"_")
+      assign(name, trajectory_name)
+      traffic_val <- nodes_load[i] * nodes_capacity[i] - lambda_simmer
+      print(traffic_val)
+      print(lambda_simmer)
+      print(nodes_load[i]*nodes_capacity[i])
+      env<- simmer_generator(env, get(name), name, traffic_val)
+    }
+  }
+  return(env)
+}
+
+
+```
+<!-- ### Main function to perform simulation using trajectories in a simmer environment -->
+<!-- Inputs: -->
+<!-- - **g**: Graph object representing the network topology -->
+<!-- - **traffic_file**: Data frame containing traffic information -->
+<!-- - **PS_size**: Packet size -->
+<!-- - **PS_weights**: Packet weights -->
+<!-- - **load**: Traffic load (default: $0.3$) -->
+<!-- - **CapacityGbps**: Link capacity in Gbps (default: $10~Gb/s$) -->
+
+<!-- Output: -->
+<!-- - List containing delay and traffic information -->
+
+```{r include=FALSE}
+simulation_simmer <- function(g, traffic_file, PS_size, PS_weights, load = 0.3, CapacityGbps = 10){
+  E(g)$Queue_Delay_sim <- 0
+  E(g)$Queue_Delay_theor_VP_upbound99 <- 0
+  E(g)$Queue_Delay_sim_99p <- 0
+
+  #####################################simmer
+  queue_delay_tr_flow <- c()
+  prop_delay_tr_flow <- c()
+  delay_tr_flow <- c()
+  delay_tr_flow_p_99 <- c()
+  exp_delay_igraph <- c()
+  delay_tr_flow_VP_upbound_p_99_100 <- c()
+  digits = 10
+  print("start simulation in simmer")
+  N = sum(PS_size*PS_weights)
+  cat("Load = ",load, "\n")
+  traffic_file$traffic_ps <- CapacityGbps*1e9/(8*N)*load
+  traffic_file$trafficGbps <- CapacityGbps*load
+  assign("traffic_file", traffic_file, .GlobalEnv)
+  for (line in 1:nrow(traffic_file))
+  {
+    print(line)
+    #env <- simmer("SuperDuperSim") #creating the simmer environment
+
+    if(traffic_file$sourceID[line] != traffic_file$destinationID[line] && traffic_file$traffic_ps[line] != 0)
+    {
+      env <- simmer()
+      lambda_simmer <- traffic_file$traffic_ps[line]
+      set.seed(42)
+      env <- simmer_resources(g, env) # add resources for all nodes of igraph (func is in the file simmer_fictions)
+      env <- simmer_crosstrajectory_simulation_mg1(env, g, traffic_file$sourceID[line], traffic_file$destinationID[line], lambda_simmer, PS_size = PS_size, PS_weights = PS_weights) #creating cross trajectories with theirs generator  (func is in the file simmer_fictions)
+      c(env, traffic_traj_name, delay_queue, delay_prop) := simmer_simulation_mg1(env, traffic_file$sourceID[line], traffic_file$destinationID[line], g, traffic_val=lambda_simmer, log_info = "", PS_size = PS_size, PS_weights = PS_weights) #creation main trajectory with its generator
+
+      env %>% #env execution
+        run(10000/lambda_simmer) #10000 packets of the main lambda trajectory
+
+
+      #########################delay results processing
+      all_arrivals_res <- data.frame(env %>%
+                                       get_mon_arrivals(per_resource = TRUE) %>%
+                                       transform(waiting_time_in_queue = round(end_time - start_time - activity_time)) %>%
+                                       transform(spending_time = end_time - start_time))
+
+
+      ############################plots for each node (only with queuing delay)
+      ##########computing the bounds and parameters (mean, variance, and etc)
+      path <- shortest_paths(g, traffic_file$sourceID[line], traffic_file$destinationID[line] ,weights = NULL, output = "both", algorithm = c("automatic"))
+      path_size <- length(path[["vpath"]][[1]])
+      n=1
+      for (node in path[["vpath"]][[1]][-path_size])
+      {
+        traffic <- dplyr::filter(all_arrivals_res, paste0("node_", node) == all_arrivals_res$resource)
+        if (length(traffic$spending_time) != 0)
+        {
+          print(node)
+          delay_nodes <- mean(traffic$spending_time)
+          p_99_result <- unname(quantile(traffic$spending_time, probs = 0.99))
+          ####################
+          print(paste("Node - ", node, ":"))
+          bounds_function_node(delay_queue[node], traffic$spending_time, digits, info = paste("Node - ", node, ";","For the traffic flow:from",traffic_file$sourceID[line],"to", traffic_file$destinationID[line]))#plot the results for each node
+          E(g)[get.edge.ids(g, c(path[["vpath"]][[1]][n],path[["vpath"]][[1]][n+1]))]$Queue_Delay_sim <- delay_nodes
+          E(g)[get.edge.ids(g, c(path[["vpath"]][[1]][n],path[["vpath"]][[1]][n+1]))]$Queue_Delay_sim_99p <- p_99_result
+          E(g)[get.edge.ids(g, c(path[["vpath"]][[1]][n],path[["vpath"]][[1]][n+1]))]$Queue_Delay_theor_VP99 <- func_bounds_VP(delay_queue[node], 0.99)
+
+          print(E(g)[get.edge.ids(g, c(path[["vpath"]][[1]][n],path[["vpath"]][[1]][n+1]))])
+          n=n+1
+
+        }
+
+      }
+
+      ###########################plots for each traffic flow (prop + queuing delays)
+      #########################delay results processing
+      all_arrivals_res <- data.frame(env %>%
+                                       get_mon_arrivals(per_resource = FALSE) %>%
+                                       transform(waiting_time_in_queue = round(end_time - start_time - activity_time)) %>%
+                                       transform(spending_time = end_time - start_time))
+      traffic <- dplyr::filter(all_arrivals_res, grepl(traffic_traj_name , all_arrivals_res$name))
+      exp_delay = sum(delay_prop,delay_queue)
+      exp_delay_igraph <- append(exp_delay_igraph,exp_delay)
+
+      bounds_function_1w_path(sum(delay_prop), sum(delay_queue), traffic$spending_time, digits, info = paste("For the traffic flow:from",traffic_file$sourceID[line],"to", traffic_file$destinationID[line]))#plot the results for tr flow
+      queue_delay_tr_flow <- append(queue_delay_tr_flow, sum(delay_queue))
+      prop_delay_tr_flow <- append(prop_delay_tr_flow, sum(delay_prop))
+      delay_tr_flow <- append(delay_tr_flow, mean(traffic$spending_time))
+      delay_tr_flow_p_99 <- append(delay_tr_flow_p_99, unname(quantile(traffic$spending_time, probs = 0.99)))
+      VP_upbound <- func_bounds_VP(delay_queue, 0.99) + sum(delay_prop)
+      delay_tr_flow_VP_upbound_p_99_100 <- append(delay_tr_flow_VP_upbound_p_99_100, VP_upbound)
+
+    } else{
+      print("no info of traffic")
+      exp_delay_igraph <- append(exp_delay_igraph,0)
+      queue_delay_tr_flow <- append(queue_delay_tr_flow, 0)
+      prop_delay_tr_flow <- append(prop_delay_tr_flow, NaN)
+      delay_tr_flow <- append(delay_tr_flow, 0)
+      delay_tr_flow_p_99 <- append(delay_tr_flow_p_99, 0)
+      delay_tr_flow_VP_upbound_p_99_100 <- append(delay_tr_flow_VP_upbound_p_99_100, 0)
+      print(delay_tr_flow)
+    }
+  }
+
+
+  igraph_df_calc <- data_frame(exp_delay_igraph, delay_tr_flow, delay_tr_flow_p_99, delay_tr_flow_VP_upbound_p_99_100)
+
+  assign("igraph_df_calc", igraph_df_calc, .GlobalEnv)
+
+  return(list(delay_tr_flow, exp_delay_igraph, delay_tr_flow_p_99, delay_tr_flow_VP_upbound_p_99_100, g))
+}
+
+```
+
+<!-- ### Function to calculate end-to-end delays theoretically -->
+<!-- Inputs: -->
+<!-- - **g**: Graph object representing the network topology -->
+<!-- - **traffic_file**: Data frame containing traffic information -->
+<!-- - **Cs2**: coefficient of variation of service time -->
+
+<!-- Output: -->
+<!-- - List containing updated graph and theoretical delay values -->
+
+```{r include=FALSE}
+prop_queue_tr_delay_e2e <- function(g, traffic_file, Cs2){
+
+  E(g)$Queue_Delay <- ifelse(E(g)$Traffic == 0, 0, E(g)$Load/(1-E(g)$Load)/E(g)$Traffic*(Cs2 + 1)/2) #M/G/1
+  latencyPropTransQueuing_theor_s <- rep(0, nrow(traffic_file))
+  latencyPercentile99_theor_s <- rep(0, nrow(traffic_file))
+  for (line in 1:nrow(traffic_file))
+  {
+    if(traffic_file$traffic_ps[line] != 0){
+      vertex_sourse <- which(V(g)$name==traffic_file$sourceID[line])
+      vertex_destination<- which(V(g)$name==traffic_file$destinationID[line])
+      path <- shortest_paths(g, vertex_sourse, vertex_destination,
+                             weights = NULL,
+                             output = "both",
+                             algorithm = c("automatic"))
+      latencyPropTransQueuing_theor_s[line] = sum(E(g)[path[["epath"]][[1]]]$Queue_Delay) + sum(E(g)[path[["epath"]][[1]]]$Prop_Delay)
+      latencyPercentile99_theor_s[line] <- func_bounds_VP(E(g)[path[["epath"]][[1]]]$Queue_Delay, 0.99) + sum(E(g)[path[["epath"]][[1]]]$Prop_Delay)
+    }
+    else {
+      latencyPropTransQueuing_theor_s[line] <- 0
+      latencyPercentile99_theor_s[line] <- 0
+    }
+  }
+  return(list(g, latencyPropTransQueuing_theor_s, latencyPercentile99_theor_s))
+}
+
+```
+## Igraph calculations
+<!-- ### Main function to perform simulation using theoretical delay calculations -->
+<!-- Inputs: -->
+<!-- - **nodes_info**: Information about nodes in the network -->
+<!-- - **links_info**: Information about links in the network -->
+<!-- - **traffic_file**: Data frame containing traffic information -->
+<!-- - **Capacity**: Link capacity in Gbps (default: $10~Gb/s$) -->
+<!-- - **calc_dist**: Flag to calculate distance (default: $FALSE$) -->
+<!-- - **distance**: Custom distance parameter (default: $5$) -->
+<!-- - **Load_local**: Local traffic load (default: $0.3$) -->
+<!-- - **Load_regional**: Regional traffic load (default: $0.5$) -->
+<!-- - **Load_national**: National traffic load (default: $0.4$) -->
+<!-- - **prefix_base**: Base prefix for nodes -->
+<!-- - **national_nodes**: List of national nodes -->
+<!-- - **regional_nodes**: List of regional nodes -->
+<!-- - **N**: Number of packets -->
+<!-- - **Cs2**: coefficient of variation of service time -->
+
+<!-- Output: -->
+<!-- - List containing updated graph and delay information -->
+```{r include=FALSE}
+simulation_igraph <- function(nodes_info, links_info, traffic_file, Capacity = 10, calc_dist =  FALSE, distance = 5, Load_local = 0.3, Load_regional = 0.5, Load_national = 0.4, prefix_base, national_nodes, regional_nodes, N, Cs2){
+
+  traffic_file$traffic_ps <- traffic_file$trafficGbps*10^9/(8*N)
+  g = graph_from_data_frame(links_info, directed = TRUE)
+  E(g)$capacityGbps <- Capacity
+  for (NCO in national_nodes){
+    a <- (filter(traffic_file, traffic_file$destinationID == V(g)$name[NCO]))
+    size <- length(a$destinationID)
+    E(g)$capacityGbps[incident(g, NCO, mode = c("in"))] <- Capacity*size
+  }
+  E(g)$Capacity <- E(g)$capacityGbps*1e9/(8*N) #p/s
+  ############distance put original distance(calc_dist = 1) or custom distance (calc_dist = 1) with paramentr "distance" in km
+  if( calc_dist == TRUE ) {
+    E(g)$Distance = E(g)$distanceKm * distance
+  }
+  else {
+    E(g)$Distance <- E(g)$distanceKm
+  }
+  ####Load of the links
+  #for Local CO
+  E(g)$Load <- Load_local
+  #national COs
+  for (NCO in national_nodes){
+    E(g)$Load[incident(g, NCO, mode = c("in"))] <- Load_national
+  }
+  #regional COs
+  for (RCO in regional_nodes){
+    E(g)$Load[incident(g, RCO, mode = c("in"))] <- Load_regional
+  }
+
+  E(g)$Traffic <- E(g)$Capacity * E(g)$Load
+  E(g)$Ni = E(g)$Load/(1-E(g)$Load) # average number of packets in each system
+  E(g)$Prop_Delay <- 5*10^(-6)*E(g)$Distance
+  c(g, traffic_file$latencyPropTransQueuing_theor_s_mg1, traffic_file$latencyPercentile99_theor_s_mg1) := prop_queue_tr_delay_e2e(g, traffic_file, Cs2)
+
+  data_av <- traffic_file$latencyPropTransQueuing_theor_s_mg1
+  data_99 <- traffic_file$latencyPercentile99_theor_s_mg1
+
+
+  assign("traffic_file", traffic_file, .GlobalEnv)
+
+  links_info$prop_delay_s <- 5*10^(-6)*links_info$distanceKm
+  assign("links_info_df", links_info, .GlobalEnv)
+
+  #removing the local traffic
+  data_av <- data_av[data_av != 0]
+  data_99 <- data_99[data_99 != 0]
+  trafficGbps <- E(g)$Capacity * E(g)$Load[E(g)$Capacity * E(g)$Load != 0]/1e9*(8*N) #Gbps
+  return(list(g, data_av, data_99, trafficGbps))
+
+}
+
+```
+
+## Building the graph:
+
+```{r}
+g <- graph_from_data_frame(links_info, directed = TRUE, vertices = nodes_info)
+```
+## Calculations of the capacity in p/s
+```{r}
+E(g)$Distance <- E(g)$distanceKm
+E(g)$Definition <- paste0(as_edgelist(g)[,1],"->",as_edgelist(g)[,2])
+E(g)$Capacity <- E(g)$capacityGbps*10^9/(8*N)
+
+```
+
+
+## Plot graph
+
+```{r}
+#plot graph
+V(g)$color <- "tomato"
+V(g)$color[national_nodes] <- "yellow"
+
+deg <- degree(g, mode="all")
+V(g)$size <- deg*1.5
+l <- layout_nicely(g)
+plot(g, edge.arrow.size=.3, vertex.label = V(g)$name, edge.curved=.5, layout=l)
+
+```
+#Igraph calculations
+## Total traffic calculatons
+## Calculations of the load, average number of packets, queueing and propagation delays:
+Load for Local COs $0.3$;
+Regional COs $0.5$;
+Rational COs $0.4$
+
+```{r}
+c(g_c10, data_av, data_99) := simulation_igraph(nodes_info, links_info, traffic_file, Capacity = 10, calc_dist = 1, distance = 0.5, Load_local, Load_regional, Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+```
+
+#Simmer simulation
+Including queuing, transmission, propagation delay
+Output table with links information
+
+Simulation of all traffic flows, comparision of experimental with theretical
+
+
+```{r include=FALSE}
+c(traffic_file$Delay_sim_s, traffic_file$Delay_th_s, traffic_file$D99_sim_s, traffic_file$VPbound_99th_s, g_c10) := simulation_simmer(g_c10, traffic_file, PS_size, PS_weights, load = 0.3, CapacityGbps = CapacityGbps)
+traffic_file_v2 <- dplyr::filter(traffic_file, VPbound_99th_s != 0)
+
+```
+#Results
+```{r}
+links_info_df
+```
+```{r}
+traffic_file_v2
+```
+#Calculation of delays for different capacities
+
+```{r}
+capacities = c(400, 800, 1200, 1600, 3200)
+c(g_c400_dg_l05, data_av_c400_dg_l05, data_99_c400_dg_l05, trafficGbps_c400_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[1], calc_dist = 0, distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+c(g_c800_dg_l05, data_av_c800_dg_l05, data_99_c800_dg_l05, trafficGbps_c800_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[2], calc_dist = 0,  distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+c(g_c12_dg_l05, data_av_c12_dg_l05, data_99_c12_dg_l05, trafficGbps_c12_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[3], calc_dist = 0,  distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+c(g_c16_dg_l05, data_av_c16_dg_l05, data_99_c16_dg_l05, trafficGbps_c16_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[4], calc_dist = 0,  distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+
+c(g_c32_dg_l05, data_av_c32_dg_l05, data_99_c32_dg_l05, trafficGbps_c32_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[5], calc_dist = 0,  distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+
+```
+
+```{r}
+text_size = 12
+
+# Boxplot for trafficGbps (bit rate in Gbps)
+df_plot_traffic <- data.frame(capacity = c(
+                                            rep("400G", length(trafficGbps_c400_dg_l05)),
+                                            rep("800G", length(trafficGbps_c800_dg_l05)),
+                                            rep("1200G", length(trafficGbps_c12_dg_l05)),
+                                            rep("1600G", length(trafficGbps_c16_dg_l05)),
+                                            rep("3200G", length(trafficGbps_c32_dg_l05))),
+                              value = c(trafficGbps_c400_dg_l05,
+                                        trafficGbps_c800_dg_l05,
+                                        trafficGbps_c12_dg_l05,
+                                        trafficGbps_c16_dg_l05,
+                                        trafficGbps_c32_dg_l05),
+                              type_of_calc = "bit rate",
+                              city = c(rep(topology_name,length(trafficGbps_c32_dg_l05)*10)))
+
+ggplot(df_plot_traffic, aes(x = fct_reorder(capacity, value, .desc = TRUE), y = value, fill = type_of_calc)) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.8, 0.99),
+    axis.title.y = element_text(size = text_size),
+    axis.title.x = element_text(size = text_size),
+    legend.text = element_text(size = text_size),
+    legend.background = element_rect(colour = "black"),
+    axis.text = element_text(size = text_size),
+    strip.text = element_text(size = text_size)
+  ) +
+  facet_grid(. ~ city ) +
+  ylab("Bit rate, Gbps") +
+  xlab("Capacity, Gbps")
+
+```
+
+```{r echo=FALSE}
+#Boxplots
+
+df_plot_capacity <- data.frame(capacity = c(
+                                            rep("400G", length(data_av_c400_dg_l05)),
+                                            rep("800G", length(data_av_c400_dg_l05)),
+                                            rep("1200G", length(data_av_c400_dg_l05)),
+                                            rep("1600G", length(data_av_c400_dg_l05)),
+                                            rep("3200G", length(data_av_c400_dg_l05)),
+                                            rep("400G", length(data_av_c400_dg_l05)),
+                                            rep("800G", length(data_av_c400_dg_l05)),
+                                            rep("1200G", length(data_av_c400_dg_l05)),
+                                            rep("1600G", length(data_av_c400_dg_l05)),
+                                            rep("3200G", length(data_av_c400_dg_l05))),
+                               value = c(data_99_c400_dg_l05,
+                                         data_99_c800_dg_l05,
+                                         data_99_c12_dg_l05,
+                                         data_99_c16_dg_l05,
+                                         data_99_c32_dg_l05,
+                                         data_av_c400_dg_l05,
+                                         data_av_c800_dg_l05,
+                                         data_av_c12_dg_l05,
+                                         data_av_c16_dg_l05,
+                                         data_av_c32_dg_l05
+                                         ),
+                               type_of_calc = c(rep("Vysochanskij–Petunin 99th",length(data_av_c400_dg_l05)*5),
+                                                rep("average delay",length(data_av_c400_dg_l05)*5)),
+                               city = c(rep(topology_name,length(data_av_c400_dg_l05)*10)))
+
+# Calculate the mean N values for each capacity group
+N_means <- c(mean(data_99_c400_dg_l05)/mean(data_av_c400_dg_l05),
+             mean(data_99_c800_dg_l05)/mean(data_av_c800_dg_l05),
+             mean(data_99_c12_dg_l05)/mean(data_av_c12_dg_l05),
+             mean(data_99_c16_dg_l05)/mean(data_av_c16_dg_l05),
+             mean(data_99_c32_dg_l05)/mean(data_av_c32_dg_l05))
+N_means_y <- c(max(data_99_c400_dg_l05),
+               max(data_99_c800_dg_l05),
+               max(data_99_c12_dg_l05),
+               max(data_99_c16_dg_l05),
+               max(data_99_c32_dg_l05))
+
+text_size = 12
+# Grouped boxplot
+ggplot(df_plot_capacity, aes(x = fct_reorder(capacity, value, .desc = TRUE), y = value * 1000000, fill = type_of_calc)) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.8, 0.99),
+    axis.title.y = element_text(size = text_size),
+    axis.title.x = element_text(size = text_size),
+    legend.text = element_text(size = text_size),
+    legend.background = element_rect(colour = "black"),
+    axis.text = element_text(size = text_size),
+    strip.text = element_text(size = text_size)
+  ) +
+  facet_grid(. ~ city ) +
+  ylab("Delay, us") +
+  xlab("Capacity, Gbps") +
+  annotate("text", x = c(1,2,3,4,5), y = N_means_y*1e6 - 1,
+           label = paste0(round(N_means, 3), "x"), vjust = -0.5, size = text_size/2.5)
+```
+As shown in the plot, the queuing delay does not significantly affect the e2e delay. This is because it is too low compared to the propagation delay and does not result in noticeable changes for changing capacity higher than 800G.
+
+
+
+#Calculation of delays for different distances
+```{r}
+#Calculation of delays for different distances
+c(g_c100_d05g_l05, data_av_c100_d05g_l05, data_99_c100_d05g_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = 800, calc_dist = 1, distance = 0.5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+
+#Calculation of delays for different distances
+c(g_c100_dg_l05, data_av_c100_dg_l05, data_99_c100_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = 800, calc_dist = 1, distance = 1, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+
+c(g_c100_d2g_l05, data_av_c100_d2g_l05, data_99_c100_d2g_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = 800, calc_dist = 1, distance = 2, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+c(g_c100_d4g_l05, data_av_c100_d4g_l05, data_99_c100_d4g_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = 800, calc_dist = 1, distance = 4, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+c(g_c100_d10g_l05, data_av_c100_d10g_l05, data_99_c100_d10g_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = 800, calc_dist = 1, distance = 10, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+```
+
+```{r echo=FALSE}
+diam_km <-  round(diameter(g_c100_d05g_l05, directed = TRUE, unconnected = TRUE, weights = E(g_c100_d05g_l05)$Distance), digits = 2)
+av_link_km <- round(mean(E(g_c100_d05g_l05)$Distance), digits = 2)
+name_05 <- paste0("0.5x\n", "Diam = ", diam_km, "km\n av_link_dist", " = ", av_link_km, "km")
+name_1 <- paste("1x\n", "Diam = ", round(diameter(g_c100_dg_l05, directed = TRUE, unconnected = TRUE, weights = E(g_c100_dg_l05)$Distance), digits = 2), "km\nav_link_dist = ", round(mean(E(g_c100_dg_l05)$Distance), digits = 2), "km")
+name_2 <- paste("2x\n", "Diam = ", round(diameter(g_c100_d2g_l05, directed = TRUE, unconnected = TRUE, weights = E(g_c100_d2g_l05)$Distance), digits = 2), "km\nav_link_dist = ", round(mean(E(g_c100_d2g_l05)$Distance), digits = 2), "km")
+name_4 <- paste("4x\n", "Diam = ", round(diameter(g_c100_d4g_l05, directed = TRUE, unconnected = TRUE, weights = E(g_c100_d4g_l05)$Distance), digits = 2), "km\nav_link_dist = ", round(mean(E(g_c100_d4g_l05)$Distance), digits = 2), "km")
+name_10 <- paste("10x\n", "Diam = ", round(diameter(g_c100_d10g_l05, directed = TRUE, unconnected = TRUE, weights = E(g_c100_d10g_l05)$Distance), digits = 2), "km\nav_link_dist = ", round(mean(E(g_c100_d10g_l05)$Distance), digits = 2), "km")
+
+####distanceVSdelay
+distance = c(
+             rep(name_1, length(data_99_c100_dg_l05)),
+             rep(name_2, length(data_99_c100_d2g_l05)),
+             rep(name_4, length(data_99_c100_d4g_l05)),
+             rep(name_10, length(data_99_c100_d10g_l05)),
+             rep(name_1, length(data_av_c100_dg_l05)),
+             rep(name_2, length(data_av_c100_d2g_l05)),
+             rep(name_4, length(data_av_c100_d4g_l05)),
+             rep(name_10, length(data_av_c100_d10g_l05))
+  )
+
+type_of_calc = c(rep("Vysochanskij–Petunin 99th",length(distance)/2),
+                 rep("average delay",length(distance)/2))
+
+paste("0.5x", "diam", diam_km, "km av link dist", av_link_km, "km")
+value = c(
+  data_99_c100_dg_l05,
+  data_99_c100_d2g_l05,
+  data_99_c100_d4g_l05,
+  data_99_c100_d10g_l05,
+  data_av_c100_dg_l05,
+  data_av_c100_d2g_l05,
+  data_av_c100_d4g_l05,
+  data_av_c100_d10g_l05
+  )
+
+df_plot_dist <- data.frame(distance, value, type_of_calc, city = c(rep(topology_name,length(type_of_calc))))
+
+N_means_delay <- c(
+  mean(data_99_c100_dg_l05) / mean(data_av_c100_dg_l05),
+  mean(data_99_c100_d2g_l05) / mean(data_av_c100_d2g_l05),
+  mean(data_99_c100_d4g_l05) / mean(data_av_c100_d4g_l05),
+  mean(data_99_c100_d10g_l05) / mean(data_av_c100_d10g_l05)
+)
+
+N_means_delay_y <- c(
+  max(data_99_c100_dg_l05) ,
+  max(data_99_c100_d2g_l05),
+  max(data_99_c100_d4g_l05),
+  max(data_99_c100_d10g_l05)
+)
+
+df_plot_dist$distance <- factor(df_plot_dist$distance, levels = c(name_1, name_2, name_4, name_10))
+
+text_size = 12
+# grouped df_plot_dist
+ggplot(df_plot_dist, aes(x=distance, y=value*1000000, fill=type_of_calc)) +
+  geom_boxplot()+
+  theme_gray() +
+  theme(
+     legend.title = element_blank(), legend.position = c(0.25, 0.85),
+     axis.title.y = element_text(size = text_size),
+     axis.title.x = element_text(size = text_size),
+     legend.text = element_text(size = text_size),
+     strip.text = element_text(size = text_size)
+   ) +
+  facet_grid(.~city)+
+  ylab("Delay, us") +
+  xlab("Link distance") +
+  annotate("text", x = c(1,2,3,4), y = N_means_delay_y*1e6-3,
+           label = paste0(round(N_means_delay, 3), "x"), vjust = -0.5, size = text_size/2)
+
+
+```
+```{r}
+
+prop_queue_tr_delay_e2e <- function(g, traffic_file, Cs2){
+
+  E(g)$Queue_Delay <- ifelse(E(g)$Traffic == 0, 0, E(g)$Load/(1-E(g)$Load)/E(g)$Traffic*(Cs2 + 1)/2) #M/G/1
+  latencyPropTransQueuing_theor_s <- rep(0, nrow(traffic_file))
+  latencyPercentile99_theor_s <- rep(0, nrow(traffic_file))
+  
+  latencyProp_s <- rep(0, nrow(traffic_file))
+  latencyPercentile99_theor_TransQueuing_s <- rep(0, nrow(traffic_file))
+  processing_FEC_s <- rep(0, nrow(traffic_file))
+  
+  for (line in 1:nrow(traffic_file))
+  {
+    if(traffic_file$traffic_ps[line] != 0){
+      vertex_sourse <- which(V(g)$name==traffic_file$sourceID[line])
+      vertex_destination<- which(V(g)$name==traffic_file$destinationID[line])
+      path <- shortest_paths(g, vertex_sourse, vertex_destination,
+                             weights = NULL,
+                             output = "both",
+                             algorithm = c("automatic"))
+      latencyPropTransQueuing_theor_s[line] = sum(E(g)[path[["epath"]][[1]]]$Queue_Delay) + sum(E(g)[path[["epath"]][[1]]]$Prop_Delay)
+      latencyPercentile99_theor_s[line] <- func_bounds_VP(E(g)[path[["epath"]][[1]]]$Queue_Delay, 0.99) + sum(E(g)[path[["epath"]][[1]]]$Prop_Delay)
+      
+      latencyProp_s[line] = sum(E(g)[path[["epath"]][[1]]]$Prop_Delay)
+      latencyPercentile99_theor_TransQueuing_s[line] <- func_bounds_VP(E(g)[path[["epath"]][[1]]]$Queue_Delay, 0.99)
+      processing_FEC_s[line] <- 4*1e-6*length(path[["epath"]][[1]])
+    }
+    else {
+      latencyPropTransQueuing_theor_s[line] <- 0
+      latencyPercentile99_theor_s[line] <- 0
+      latencyProp_s[line] <- 0
+      latencyPercentile99_theor_TransQueuing_s[line] <- 0
+      processing_FEC_s[line] <- 0
+
+    }
+  }
+  
+  return(list(g, latencyPropTransQueuing_theor_s, latencyPercentile99_theor_s, latencyProp_s, latencyPercentile99_theor_TransQueuing_s, processing_FEC_s))
+}
+
+
+simulation_igraph <- function(nodes_info, links_info, traffic_file, Capacity = 10, calc_dist =  FALSE, distance = 5, Load_local = 0.3, Load_regional = 0.5, Load_national = 0.4, prefix_base, national_nodes, regional_nodes, N, Cs2){
+
+  traffic_file$traffic_ps <- traffic_file$trafficGbps*10^9/(8*N)
+  g = graph_from_data_frame(links_info, directed = TRUE)
+  E(g)$capacityGbps <- Capacity
+  for (NCO in national_nodes){
+    a <- (filter(traffic_file, traffic_file$destinationID == V(g)$name[NCO]))
+    size <- length(a$destinationID)
+    E(g)$capacityGbps[incident(g, NCO, mode = c("in"))] <- Capacity*size
+  }
+  E(g)$Capacity <- E(g)$capacityGbps*1e9/(8*N) #p/s
+  ############distance put original distance(calc_dist = 1) or custom distance (calc_dist = 1) with paramentr "distance" in km
+  if( calc_dist == TRUE ) {
+    E(g)$Distance = E(g)$distanceKm * distance
+  }
+  else {
+    E(g)$Distance <- E(g)$distanceKm
+  }
+  ####Load of the links
+  #for Local CO
+  E(g)$Load <- Load_local
+  #national COs
+  for (NCO in national_nodes){
+    E(g)$Load[incident(g, NCO, mode = c("in"))] <- Load_national
+  }
+  #regional COs
+  for (RCO in regional_nodes){
+    E(g)$Load[incident(g, RCO, mode = c("in"))] <- Load_regional
+  }
+
+  E(g)$Traffic <- E(g)$Capacity * E(g)$Load
+  E(g)$Ni = E(g)$Load/(1-E(g)$Load) # average number of packets in each system
+  E(g)$Prop_Delay <- 5*10^(-6)*E(g)$Distance
+  c(g, traffic_file$latencyPropTransQueuing_theor_s_mg1, traffic_file$latencyPercentile99_theor_s_mg1, latencyProp_s_mg1, latencyPercentile99_theor_TransQueuing_s_mg1, processing_FEC_s) := prop_queue_tr_delay_e2e(g, traffic_file, Cs2)
+
+  data_prop <- latencyProp_s_mg1
+  data_99_TransQueuing <- latencyPercentile99_theor_TransQueuing_s_mg1
+
+
+  assign("traffic_file", traffic_file, .GlobalEnv)
+
+  links_info$prop_delay_s <- 5*10^(-6)*links_info$distanceKm
+  assign("links_info_df", links_info, .GlobalEnv)
+
+  #removing the local traffic
+  data_av <- data_av[data_av != 0]
+  data_99 <- data_99[data_99 != 0]
+  trafficGbps <- E(g)$Capacity * E(g)$Load[E(g)$Capacity * E(g)$Load != 0]/1e9*(8*N) #Gbps
+  
+  return(list(g, data_prop, data_99_TransQueuing, trafficGbps, processing_FEC_s))
+  
+
+}
+
+
+
+```
+
+
+```{r}
+capacities = c(400, 800, 1200, 1600, 3200)
+c(g_c400_dg_l05, data_prop_c400_dg_l05, data_99_TransQueuing_c400_dg_l05, trafficGbps_c400_dg_l05, processing_FEC_s_c400_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[1], calc_dist = 0, distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+c(g_c800_dg_l05, data_prop_c800_dg_l05, data_99_TransQueuing_c800_dg_l05, trafficGbps_c800_dg_l05, processing_FEC_s_c800_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[2], calc_dist = 0,  distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+c(g_c12_dg_l05, data_prop_c12_dg_l05, data_99_TransQueuing_c12_dg_l05, trafficGbps_c12_dg_l05, processing_FEC_s_c12_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[3], calc_dist = 0,  distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+c(g_c16_dg_l05, data_prop_c16_dg_l05, data_99_TransQueuing_c16_dg_l05, trafficGbps_c16_dg_l05, processing_FEC_s_c16_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[4], calc_dist = 0,  distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+
+c(g_c32_dg_l05, data_prop_c32_dg_l05, data_99_TransQueuing_c32_dg_l05, trafficGbps_c32_dg_l05, processing_FEC_s_c32_dg_l05) :=simulation_igraph(nodes_info, links_info, traffic_file, Capacity = capacities[5], calc_dist = 0,  distance = 5, Load_local = Load_local, Load_regional = Load_regional, Load_national = Load_national, prefix_base, national_nodes, regional_nodes , N, Cs2)
+```
+
+```{r}
+# Create a data frame with mean propagation and queuing delays for each capacity
+df_plot_delay <- data.frame(
+  capacity = factor(c("400G", "800G", "1200G", "1600G", "3200G"), 
+                    levels = c("400G", "800G", "1200G", "1600G", "3200G")),
+  delay_type = rep(c("Propagation Delay", "D.99 Queuing Delay", "FEC processing"), each = 5),
+  delay_value = c(
+    mean(data_prop_c400_dg_l05), mean(data_prop_c800_dg_l05), mean(data_prop_c12_dg_l05), mean(data_prop_c16_dg_l05), mean(data_prop_c32_dg_l05),
+    mean(data_99_TransQueuing_c400_dg_l05), mean(data_99_TransQueuing_c800_dg_l05), mean(data_99_TransQueuing_c12_dg_l05), mean(data_99_TransQueuing_c16_dg_l05), mean(data_99_TransQueuing_c32_dg_l05),
+    mean(processing_FEC_s_c400_dg_l05), mean(processing_FEC_s_c800_dg_l05), mean(processing_FEC_s_c12_dg_l05), mean(processing_FEC_s_c16_dg_l05), mean(processing_FEC_s_c32_dg_l05)
+    
+  )
+)
+
+# Plot the barplot
+ggplot(df_plot_delay, aes(x = capacity, y = delay_value * 1e6, fill = delay_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_minimal() +
+  labs(
+    x = "Capacity (Gbps)",
+    y = "Delay (us)",
+    fill = "Type of Delay"
+  ) +
+  scale_fill_manual(values = c("Propagation Delay" = "steelblue", "D.99 Queuing Delay" = "tomato", "FEC processing" = "yellow")) +
+  theme(
+    text = element_text(size = 12),
+    legend.position = "top"
+  )
+
+```
+```{r}
+df_MAN157 = data.frame(prop = c(mean(data_prop_c400_dg_l05), mean(data_prop_c800_dg_l05), mean(data_prop_c12_dg_l05), mean(data_prop_c16_dg_l05), mean(data_prop_c32_dg_l05)), 
+                       queuing = c( mean(data_99_TransQueuing_c400_dg_l05), mean(data_99_TransQueuing_c800_dg_l05), mean(data_99_TransQueuing_c12_dg_l05), mean(data_99_TransQueuing_c16_dg_l05), mean(data_99_TransQueuing_c32_dg_l05) ))
+
+```
+
+#Creating the report file
+```{r include=FALSE}
+update_file <- function(links_info_df, traffic_file, file_name = "Milano_topology_result.xlsx", file_old_name)
+{
+    wb <- createWorkbook()
+    addWorksheet(wb, sheetName = "Nodes")
+    writeData(wb, sheet = 1, read_excel(file_old_name, sheet = 1))
+    addWorksheet(wb, sheetName = "Links")
+    writeData(wb, sheet = 2, links_info_df)
+    addWorksheet(wb, sheetName = "Services")
+    writeData(wb, sheet = 3, traffic_file)
+    saveWorkbook(wb, file_name, overwrite = TRUE)
+}
+
+
+
+```
+```{r}
+update_file(links_info_df, traffic_file_v2, file_name = paste0(topology_name, "_topology_result.xlsx"), file_old_name = file_name_v2)
+
+```
+
